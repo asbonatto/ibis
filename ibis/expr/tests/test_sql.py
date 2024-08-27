@@ -19,10 +19,7 @@ import ibis.expr.operations.temporal as time_ops
 from ibis.common.temporal import DateUnit, IntervalUnit, TimeUnit
 from ibis.expr.sql import Catalog, get_compiler
 
-
-
 pytest.importorskip("black")
-
 
 
 def parse_param(param):
@@ -394,6 +391,7 @@ def test_round_trippable_with_array_args(op, backend):
         expr = df.mutate(out_col=op(tuple([df[k] for k in cols])).to_expr())
         round_trip(df, expr, backend)
 
+
 catalog = {
     "employee": {"first_name": "string", "last_name": "string", "id": "int64"},
     "call": {
@@ -409,7 +407,7 @@ catalog = {
 
 def test_parse_sql_basic_projection(snapshot):
     sql = "SELECT *, first_name as first FROM employee WHERE id < 5 ORDER BY id DESC"
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
@@ -427,7 +425,7 @@ WHERE
   id < 5
 ORDER BY
   id DESC"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
@@ -440,7 +438,7 @@ JOIN call
   ON employee.id = call.employee_id
 JOIN call_outcome
   ON call.call_outcome_id = call_outcome.id"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
@@ -452,7 +450,7 @@ SELECT
   sum(call_attempts) AS attempts
 FROM call
 GROUP BY employee_id"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
@@ -466,7 +464,7 @@ FROM employee
 LEFT JOIN call
   ON employee.id = call.employee_id
 GROUP BY id"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
@@ -481,14 +479,14 @@ FROM (
   JOIN call_outcome ON call.call_outcome_id = call_outcome.id
 ) AS t
 GROUP BY t.employee_id"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
 
 def test_parse_sql_simple_reduction(snapshot):
     sql = """SELECT AVG(call_attempts) AS mean FROM call"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
@@ -501,21 +499,21 @@ WHERE call_attempts > (
   SELECT avg(call_attempts) AS mean
   FROM call
 )"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
 
 def test_parse_sql_simple_select_count(snapshot):
     sql = """SELECT COUNT(first_name) FROM employee"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
 
 def test_parse_sql_table_alias(snapshot):
     sql = """SELECT e.* FROM employee AS e"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
@@ -526,7 +524,7 @@ SELECT *, first_name as first FROM employee
 LEFT JOIN call ON employee.id = call.employee_id
 WHERE id < 5
 ORDER BY id DESC"""
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
 
@@ -536,6 +534,6 @@ def test_parse_sql_in_clause(snapshot):
 SELECT first_name FROM employee
 WHERE first_name IN ('Graham', 'John', 'Terry', 'Eric', 'Michael')"""
 
-    expr = ibis.parse_sql(sql, catalog)
+    expr = ibis.parse_sql(sql, catalog, dialect="duckdb")
     code = ibis.decompile(expr, format=True)
     snapshot.assert_match(code, "decompiled.py")
