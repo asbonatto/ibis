@@ -85,26 +85,26 @@ def convert(step, catalog, compiler):
     raise TypeError(type(step))
 
 
-@convert.register(sgp.Aggregate)
-def convert_aggregate(agg, catalog, compiler):
-    catalog = catalog.overlay(agg, compiler)
-    source = catalog[agg.source]
+# @convert.register(sgp.Aggregate)
+# def convert_aggregate(agg, catalog, compiler):
+#     catalog = catalog.overlay(agg, compiler)
+#     source = catalog[agg.source]
 
-    if agg.aggregations:
-        metrics = [
-            convert(metric, catalog=catalog, compiler=compiler)
-            for metric in agg.aggregations
-        ]
+#     if agg.aggregations:
+#         metrics = [
+#             convert(metric, catalog=catalog, compiler=compiler)
+#             for metric in agg.aggregations
+#         ]
 
-        groups = [
-            convert(g, catalog=catalog, compiler=compiler) for k, g in agg.group.items()
-        ]
-        if groups:
-            source = source.aggregate(metrics, by=groups)
-        else:
-            source = source.mutate(*metrics)
+#         groups = [
+#             convert(g, catalog=catalog, compiler=compiler) for k, g in agg.group.items()
+#         ]
+#         if groups:
+#             source = source.aggregate(metrics, by=groups)
+#         else:
+#             source = source.mutate(*metrics)
 
-    return source
+#     return source
 
 
 @convert.register(sgp.Scan)
@@ -129,6 +129,43 @@ def convert_scan(scan, catalog, compiler):
     return table
 
 
+def qualify_projections(projections, groups):
+    # The sqlglot planner will (sometimes) alias projections to the aggregate
+    # that precedes it.
+    #
+    # - Sort: lineitem (132849388268768)
+    #   Context:
+    #     Key:
+    #       - "l_returnflag"
+    #       - "l_linestatus"
+    #   Projections:
+    #     - lineitem._g0 AS "l_returnflag"
+    #     - lineitem._g1 AS "l_linestatus"
+    #     <snip>
+    #   Dependencies:
+    #   - Aggregate: lineitem (132849388268864)
+    #     Context:
+    #       Aggregations:
+    #         <snip>
+    #       Group:
+    #         - "lineitem"."l_returnflag"  <-- this is _g0
+    #         - "lineitem"."l_linestatus"  <-- this is _g1
+    #         <snip>
+    #
+    #  These aliases are stored in a dictionary in the aggregate `groups`, so if
+    #  those are pulled out beforehand then we can use them to replace the
+    #  aliases in the projections.
+
+    def transformer(node):
+        if isinstance(node, sge.Alias) and (name := node.this.name).startswith("_g"):
+            return groups[name]
+        return node
+
+    projects = [project.transform(transformer) for project in projections]
+
+    return projects
+
+
 @convert.register(sgp.Sort)
 def convert_sort(sort, catalog, compiler):
     catalog = catalog.overlay(sort, compiler)
@@ -140,11 +177,20 @@ def convert_sort(sort, catalog, compiler):
         table = table.order_by(keys)
 
     if sort.projections:
+        groups = {}
+        # group definitions that may be used in projections are defined
+        # in the aggregate in dependencies...
+        for dep in sort.dependencies:
+            if (group := getattr(dep, "group", None)) is not None:
+                groups |= group
         projs = [
             convert(proj, catalog=catalog, compiler=compiler)
-            for proj in sort.projections
+            for proj in qualify_projections(sort.projections, groups)
         ]
         table = table.select(projs)
+
+    if isinstance(sort.limit, int):
+        table = table.limit(sort.limit)
 
     return table
 
@@ -167,8 +213,8 @@ def convert_join(join, catalog, compiler):
         right_table = catalog[right_name]
         join_kind = _join_types[desc["side"]]
 
+        predicate = None
         if desc["join_key"]:
-            predicate = None
             for left_key, right_key in zip(desc["source_key"], desc["join_key"]):
                 left_key = convert(left_key, catalog=catalog, compiler=compiler)
                 right_key = convert(right_key, catalog=catalog, compiler=compiler)
@@ -176,9 +222,13 @@ def convert_join(join, catalog, compiler):
                     predicate = left_key == right_key
                 else:
                     predicate &= left_key == right_key
-        else:
+
+        if "condition" in desc.keys():
             condition = desc["condition"]
-            predicate = convert(condition, catalog=catalog, compiler=compiler)
+            if predicate is None:
+                predicate = convert(condition, catalog=catalog, compiler=compiler)
+            else:
+                predicate &= convert(condition, catalog=catalog, compiler=compiler)
 
         left_table = left_table.join(right_table, predicates=predicate, how=join_kind)
 
@@ -189,6 +239,51 @@ def convert_join(join, catalog, compiler):
     catalog[left_name] = left_table
 
     return left_table
+
+
+def replace_operands(agg):
+    # The sqlglot planner will pull out computed operands into a separate
+    # section and alias them #
+    # e.g.
+    # Context:
+    #   Aggregations:
+    #     - SUM("_a_0") AS "sum_disc_price"
+    #   Operands:
+    #     - "lineitem"."l_extendedprice" * (1 - "lineitem"."l_discount") AS _a_0
+    #
+    # For the purposes of decompiling, we want these to be inline, so here we
+    # replace those new aliases with the parsed sqlglot expression
+    operands = {operand.alias: operand.this for operand in agg.operands}
+
+    def transformer(node):
+        if isinstance(node, sge.Column) and node.name in operands.keys():
+            return operands[node.name]
+        return node
+
+    aggs = [item.transform(transformer) for item in agg.aggregations]
+
+    agg.aggregations = aggs
+
+    return agg
+
+
+@convert.register(sgp.Aggregate)
+def convert_aggregate(agg, catalog, compiler):
+    catalog = catalog.overlay(agg, compiler=compiler)
+
+    agg = replace_operands(agg)
+
+    table = catalog[agg.source]
+    if agg.aggregations:
+        metrics = [
+            convert(a, catalog=catalog, compiler=compiler) for a in agg.aggregations
+        ]
+        groups = [
+            convert(g, catalog=catalog, compiler=compiler) for k, g in agg.group.items()
+        ]
+        table = table.aggregate(metrics, by=groups)
+
+    return table
 
 
 @convert.register(sge.Subquery)
@@ -303,24 +398,14 @@ def convert_null(expr, catalog, compiler):
 
 @convert.register(sge.Ordered)
 def convert_ordered(ordered, catalog, compiler):
-    this = convert(ordered.this, catalog=catalog, compiler=compiler)
-    desc = ordered.args["desc"]  # not exposed as an attribute
-    return ibis.desc(this) if desc else ibis.asc(this)
-
-
-# NOTE: copied from https://github.com/gforsyth/ibis/commit/120375a8ba113177eb3ce975d449810a1c1e3717
-@convert.register(sge.Cast)
-def cast(cast, catalog, compiler):
-    this = convert(cast.this, catalog, compiler)
-    to = convert(cast.to, catalog, compiler)
-
-    return this.cast(to)
-
-
-# NOTE: copied from https://github.com/gforsyth/ibis/commit/120375a8ba113177eb3ce975d449810a1c1e3717
-@convert.register(sge.DataType)
-def datatype(datatype, catalog, compiler):
-    return SqlglotType().to_ibis(datatype)
+    this = ibis._[ordered.this.name]
+    desc = ordered.args.get("desc", False)  # not exposed as an attribute
+    nulls_first = ordered.args.get("nulls_first", False)
+    return (
+        ibis.desc(this, nulls_first=nulls_first)
+        if desc
+        else ibis.asc(this, nulls_first=nulls_first)
+    )
 
 
 _unary_operations = {
@@ -382,7 +467,12 @@ def convert_binary(binary, catalog, compiler):
         expr = expr[name]
 
     as_expr = lambda obj: (
-        obj.to_expr() if not isinstance(this, ibis.expr.types.Column) else obj
+        obj.to_expr()
+        if not any(
+            isinstance(this, dtype)
+            for dtype in [ibis.expr.types.Column, ibis.expr.types.Scalar]
+        )
+        else obj
     )
     this = as_expr(this)
     expr = as_expr(expr)
@@ -420,6 +510,24 @@ def convert_in(in_, catalog, compiler):
         convert(expression, catalog, compiler) for expression in in_.expressions
     ]
     return this.isin(candidates)
+
+
+@convert.register(sge.Cast)
+def cast(cast, catalog, compiler):
+    this = convert(cast.this, catalog, compiler)
+    to = convert(cast.to, catalog, compiler)
+
+    return this.cast(to)
+
+
+@convert.register(sge.DataType)
+def datatype(datatype, catalog, compiler):
+    return SqlglotType().to_ibis(datatype)
+
+
+@convert.register(sge.Count)
+def count(count, catalog, compiler):
+    return ibis._.count()
 
 
 @public
@@ -655,7 +763,6 @@ def convert_interval_op(func, catalog, compiler, op):
 
 @convert.register(sge.Extract)
 def convert_extract(func, catalog, compiler):
-    
     this = str(func.this.this)
     col = convert(func.expression, catalog, compiler)
 
@@ -739,11 +846,12 @@ def convert_timefromparts(func, catalog, compiler):
 
     return ops.TimeFromHMS(**params).to_expr()
 
-@convert.register(sge.TsOrDsToTimestamp)
-def convert_ts_or_ds_to_timestamp(func, catalog, compiler):
-    
-    this = convert(func.this, catalog, compiler)
-    raise ValueError("Parser lost format string in the translation")
+
+# @convert.register(sge.TsOrDsToTimestamp)
+# def convert_ts_or_ds_to_timestamp(func, catalog, compiler):
+#     this = convert(func.this, catalog, compiler)
+#     raise ValueError("Parser lost format string in the translation")
+
 
 @convert.register(sge.TimestampFromParts)
 def convert_timestampfromparts(func, catalog, compiler):
@@ -764,9 +872,7 @@ def convert_timestampfromparts(func, catalog, compiler):
 
 @convert.register(sge.Func)
 def convert_func(func, catalog, compiler):
-
     this = convert(func.this, catalog=catalog, compiler=compiler)
-    
 
     skip_params = ["this", "is_left", "binary"]
     keys = [k for k in func.arg_types if k not in skip_params]
@@ -822,8 +928,8 @@ def convert_func(func, catalog, compiler):
         sge.DayOfWeek: dict(OP_NAME=ops.DayOfWeekName),
         sge.StrToTime: dict(OP_NAME=ops.StringToTimestamp, format_str="format"),
         sge.UnixToTime: dict(OP_NAME=partial(ops.TimestampFromUNIX, unit="s")),
-        sge.StrToDate: dict(OP_NAME=ops.StringToDate, format_str = "format"),
-        sge.TimeTrunc : dict(OP_NAME=ops.TimeTruncate, unit = "unit")
+        sge.StrToDate: dict(OP_NAME=ops.StringToDate, format_str="format"),
+        sge.TimeTrunc: dict(OP_NAME=ops.TimeTruncate, unit="unit"),
     }
 
     op = mapper[op_name].get("OP_NAME")
@@ -874,7 +980,6 @@ def convert_array(array, catalog, compiler):
 
 @convert.register(sge.Anonymous)
 def convert_anonymous(func, catalog, compiler):
-    
     col = convert(func.expressions[0], catalog, compiler)
     params = [
         convert(expr, catalog=catalog, compiler=compiler)
